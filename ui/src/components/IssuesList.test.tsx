@@ -148,11 +148,13 @@ describe("IssuesList", () => {
     mockIssuesApi.list.mockReset();
     mockIssuesApi.listLabels.mockReset();
     mockAuthApi.getSession.mockReset();
+    mockIssuesApi.list.mockResolvedValue([]);
     mockIssuesApi.listLabels.mockResolvedValue([]);
     mockAuthApi.getSession.mockResolvedValue({ user: null, session: null });
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     container.remove();
   });
 
@@ -179,6 +181,58 @@ describe("IssuesList", () => {
       expect(container.textContent).toContain("Server result");
       expect(container.textContent).not.toContain("Local issue");
     });
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("debounces search updates so typing does not notify the page on every keystroke", async () => {
+    vi.useFakeTimers();
+
+    const onSearchChange = vi.fn();
+    const localIssue = createIssue({ id: "issue-local", identifier: "PAP-1", title: "Local issue" });
+
+    const { root } = renderWithQueryClient(
+      <IssuesList
+        issues={[localIssue]}
+        agents={[]}
+        projects={[]}
+        viewStateKey="paperclip:test-issues"
+        onSearchChange={onSearchChange}
+        onUpdateIssue={() => undefined}
+      />,
+      container,
+    );
+
+    const input = container.querySelector('input[aria-label="Search issues"]') as HTMLInputElement | null;
+    expect(input).not.toBeNull();
+    const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+    expect(valueSetter).toBeTypeOf("function");
+
+    act(() => {
+      if (!input || !valueSetter) return;
+      valueSetter.call(input, "a");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      valueSetter.call(input, "ab");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    expect(onSearchChange).not.toHaveBeenCalled();
+
+    act(() => {
+      vi.advanceTimersByTime(149);
+    });
+
+    expect(onSearchChange).not.toHaveBeenCalled();
+
+    await act(async () => {
+      vi.advanceTimersByTime(1);
+      await Promise.resolve();
+    });
+
+    expect(onSearchChange).toHaveBeenCalledTimes(1);
+    expect(onSearchChange).toHaveBeenCalledWith("ab");
 
     act(() => {
       root.unmount();

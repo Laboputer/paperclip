@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useMemo, useState, useCallback, useRef } from "react";
+import { startTransition, useDeferredValue, useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { pickTextColorForPillBg } from "@/lib/color-contrast";
 import { useDialog } from "../context/DialogContext";
@@ -30,6 +30,7 @@ import type { Issue } from "@paperclipai/shared";
 
 const statusOrder = ["in_progress", "todo", "backlog", "in_review", "blocked", "done", "cancelled"];
 const priorityOrder = ["critical", "high", "medium", "low"];
+const ISSUE_SEARCH_DEBOUNCE_MS = 150;
 
 function statusLabel(status: string): string {
   return status.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -175,6 +176,50 @@ interface IssuesListProps {
   };
   onSearchChange?: (search: string) => void;
   onUpdateIssue: (id: string, data: Record<string, unknown>) => void;
+}
+
+function IssueSearchInput({
+  value,
+  onDebouncedChange,
+}: {
+  value: string;
+  onDebouncedChange?: (search: string) => void;
+}) {
+  const [draftValue, setDraftValue] = useState(value);
+  const lastCommittedValueRef = useRef(value);
+
+  useEffect(() => {
+    setDraftValue(value);
+    lastCommittedValueRef.current = value;
+  }, [value]);
+
+  useEffect(() => {
+    if (!onDebouncedChange || draftValue === lastCommittedValueRef.current) return;
+
+    const timeoutId = window.setTimeout(() => {
+      lastCommittedValueRef.current = draftValue;
+      startTransition(() => {
+        onDebouncedChange(draftValue);
+      });
+    }, ISSUE_SEARCH_DEBOUNCE_MS);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [draftValue, onDebouncedChange]);
+
+  return (
+    <div className="relative w-48 sm:w-64 md:w-80">
+      <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+      <Input
+        value={draftValue}
+        onChange={(e) => {
+          setDraftValue(e.target.value);
+        }}
+        placeholder="Search issues..."
+        className="pl-7 text-xs sm:text-sm"
+        aria-label="Search issues"
+      />
+    </div>
+  );
 }
 
 export function IssuesList({
@@ -394,19 +439,13 @@ export function IssuesList({
             <Plus className="h-4 w-4 sm:mr-1" />
             <span className="hidden sm:inline">New Issue</span>
           </Button>
-          <div className="relative w-48 sm:w-64 md:w-80">
-            <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              value={issueSearch}
-              onChange={(e) => {
-                setIssueSearch(e.target.value);
-                onSearchChange?.(e.target.value);
-              }}
-              placeholder="Search issues..."
-              className="pl-7 text-xs sm:text-sm"
-              aria-label="Search issues"
-            />
-          </div>
+          <IssueSearchInput
+            value={issueSearch}
+            onDebouncedChange={(nextSearch) => {
+              setIssueSearch(nextSearch);
+              onSearchChange?.(nextSearch);
+            }}
+          />
         </div>
 
         <div className="flex items-center gap-0.5 sm:gap-1 shrink-0">
