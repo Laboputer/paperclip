@@ -20,6 +20,7 @@ import {
   getApprovalsForTab,
   getInboxWorkItems,
   getInboxKeyboardSelectionIndex,
+  getInboxSearchFallbackIssues,
   getRecentTouchedIssues,
   getUnreadTouchedIssues,
   groupInboxWorkItems,
@@ -609,6 +610,65 @@ describe("inbox helpers", () => {
         query: "alpha",
       }).map((issue) => issue.id),
     ).toEqual(["newer", "older"]);
+  });
+
+  it("uses remote issue results only when local inbox search has no matches", () => {
+    const remoteMatch = makeIssue("remote-match", false);
+    remoteMatch.status = "in_progress";
+
+    expect(
+      getInboxSearchFallbackIssues({
+        query: "pull/3303",
+        filteredWorkItems: [],
+        archivedSearchIssues: [],
+        remoteIssues: [remoteMatch],
+        issueFilters: {
+          statuses: ["in_progress"],
+          priorities: [],
+          assignees: [],
+          labels: [],
+          projects: [],
+          workspaces: [],
+          showRoutineExecutions: false,
+        },
+      }).map((issue) => issue.id),
+    ).toEqual(["remote-match"]);
+
+    expect(
+      getInboxSearchFallbackIssues({
+        query: "pull/3303",
+        filteredWorkItems: [{ kind: "issue", timestamp: 1, issue: makeIssue("local", false) }],
+        archivedSearchIssues: [],
+        remoteIssues: [remoteMatch],
+        issueFilters: {
+          statuses: [],
+          priorities: [],
+          assignees: [],
+          labels: [],
+          projects: [],
+          workspaces: [],
+          showRoutineExecutions: false,
+        },
+      }),
+    ).toEqual([]);
+
+    expect(
+      getInboxSearchFallbackIssues({
+        query: "pull/3303",
+        filteredWorkItems: [],
+        archivedSearchIssues: [makeIssue("archived", false)],
+        remoteIssues: [remoteMatch],
+        issueFilters: {
+          statuses: [],
+          priorities: [],
+          assignees: [],
+          labels: [],
+          projects: [],
+          workspaces: [],
+          showRoutineExecutions: false,
+        },
+      }),
+    ).toEqual([]);
   });
 
   it("defaults the remembered inbox tab to mine and persists all", () => {
