@@ -1149,6 +1149,7 @@ describe("company portability", () => {
         key: "ANTHROPIC_API_KEY",
         description: "Provide ANTHROPIC_API_KEY for agent claudecoder",
         agentSlug: "claudecoder",
+        projectSlug: null,
         kind: "secret",
         requirement: "optional",
         defaultValue: "",
@@ -1158,12 +1159,135 @@ describe("company portability", () => {
         key: "GH_TOKEN",
         description: "Provide GH_TOKEN for agent claudecoder",
         agentSlug: "claudecoder",
+        projectSlug: null,
         kind: "secret",
         requirement: "optional",
         defaultValue: "",
         portability: "portable",
       },
     ]);
+  });
+
+  it("exports project env as portable inputs without concrete values", async () => {
+    const portability = companyPortabilityService({} as any);
+
+    projectSvc.list.mockResolvedValue([
+      {
+        id: "project-1",
+        name: "Launch",
+        urlKey: "launch",
+        description: "Ship it",
+        leadAgentId: "agent-1",
+        targetDate: null,
+        color: null,
+        status: "planned",
+        env: {
+          OPENAI_API_KEY: {
+            type: "plain",
+            value: "sk-project-secret",
+          },
+          DOCS_MODE: {
+            type: "plain",
+            value: "strict",
+          },
+          GITHUB_TOKEN: {
+            type: "secret_ref",
+            secretId: "11111111-1111-1111-1111-111111111111",
+            version: "latest",
+          },
+        },
+        executionWorkspacePolicy: null,
+        workspaces: [],
+        metadata: null,
+      },
+    ]);
+
+    const exported = await portability.exportBundle("company-1", {
+      include: {
+        company: false,
+        agents: false,
+        projects: true,
+        issues: false,
+      },
+    });
+
+    const extension = asTextFile(exported.files[".paperclip.yaml"]);
+    expect(extension).toContain("OPENAI_API_KEY:");
+    expect(extension).toContain("DOCS_MODE:");
+    expect(extension).toContain("GITHUB_TOKEN:");
+    expect(extension).not.toContain("sk-project-secret");
+    expect(extension).not.toContain('type: "secret_ref"');
+    expect(extension).not.toContain("11111111-1111-1111-1111-111111111111");
+    expect(extension).toContain('default: "strict"');
+    expect(extension).toContain('kind: "secret"');
+    expect(extension).toContain('kind: "plain"');
+  });
+
+  it("reads project env inputs back from .paperclip.yaml during preview import", async () => {
+    const portability = companyPortabilityService({} as any);
+
+    projectSvc.list.mockResolvedValue([
+      {
+        id: "project-1",
+        name: "Launch",
+        urlKey: "launch",
+        description: "Ship it",
+        leadAgentId: "agent-1",
+        targetDate: null,
+        color: null,
+        status: "planned",
+        env: {
+          OPENAI_API_KEY: {
+            type: "plain",
+            value: "sk-project-secret",
+          },
+        },
+        executionWorkspacePolicy: null,
+        workspaces: [],
+        metadata: null,
+      },
+    ]);
+
+    const exported = await portability.exportBundle("company-1", {
+      include: {
+        company: false,
+        agents: false,
+        projects: true,
+        issues: false,
+      },
+    });
+
+    const preview = await portability.previewImport({
+      source: {
+        type: "inline",
+        rootPath: exported.rootPath,
+        files: exported.files,
+      },
+      include: {
+        company: false,
+        agents: false,
+        projects: true,
+        issues: false,
+      },
+      target: {
+        mode: "new_company",
+        newCompanyName: "Imported Paperclip",
+      },
+      agents: "all",
+      collisionStrategy: "rename",
+    });
+
+    expect(preview.errors).toEqual([]);
+    expect(preview.envInputs).toContainEqual({
+      key: "OPENAI_API_KEY",
+      description: "Optional default for OPENAI_API_KEY on project launch",
+      agentSlug: null,
+      projectSlug: "launch",
+      kind: "secret",
+      requirement: "optional",
+      defaultValue: "",
+      portability: "portable",
+    });
   });
 
   it("exports routines as recurring task packages with Paperclip routine extensions", async () => {
@@ -1636,6 +1760,50 @@ describe("company portability", () => {
       name: "ClaudeCoder",
       adapterType: "process",
     }));
+  });
+
+  it("preserves agent role from frontmatter when extension block omits it", async () => {
+    const portability = companyPortabilityService({} as any);
+
+    const preview = await portability.previewImport({
+      source: {
+        type: "inline",
+        rootPath: "ceo-package",
+        files: {
+          "COMPANY.md": [
+            "---",
+            'schema: "agentcompanies/v1"',
+            'name: "CEO Role Test"',
+            "---",
+            "",
+          ].join("\n"),
+          "agents/ceo/AGENTS.md": [
+            "---",
+            'name: "CEO"',
+            'role: "ceo"',
+            "---",
+            "",
+            "# CEO",
+            "",
+            "You run the company.",
+            "",
+          ].join("\n"),
+        },
+      },
+      include: { company: true, agents: true, projects: false, issues: false },
+      target: { mode: "new_company", newCompanyName: "CEO Role Test" },
+      agents: "all",
+      collisionStrategy: "rename",
+    });
+
+    expect(preview.errors).toEqual([]);
+    expect(preview.manifest.agents).toEqual([
+      expect.objectContaining({
+        slug: "ceo",
+        name: "CEO",
+        role: "ceo",
+      }),
+    ]);
   });
 
   it("treats no-separator auth and api key env names as secrets during export", async () => {
@@ -2113,6 +2281,72 @@ describe("company portability", () => {
     const materializedFiles = agentInstructionsSvc.materializeManagedBundle.mock.calls[0]?.[1] as Record<string, string>;
     expect(materializedFiles["AGENTS.md"]).not.toMatch(/^---\n/);
     expect(materializedFiles["AGENTS.md"]).not.toContain('name: "ClaudeCoder"');
+  });
+
+  it("preserves issue labelIds through export and import round-trip", async () => {
+    const portability = companyPortabilityService({} as any);
+
+    projectSvc.list.mockResolvedValue([
+      {
+        id: "project-1",
+        name: "Launch",
+        urlKey: "launch",
+        description: null,
+        status: "active",
+        leadAgentId: null,
+        metadata: null,
+        defaultProjectWorkspaceId: null,
+      },
+    ]);
+    projectSvc.listWorkspaces.mockResolvedValue([]);
+    issueSvc.list.mockResolvedValue([
+      {
+        id: "issue-1",
+        identifier: "PAP-1",
+        title: "Labelled task",
+        description: "Has labels",
+        projectId: "project-1",
+        projectWorkspaceId: null,
+        assigneeAgentId: null,
+        status: "todo",
+        priority: "high",
+        labelIds: ["label-a", "label-b"],
+        billingCode: null,
+        executionWorkspaceSettings: null,
+        assigneeAdapterOverrides: null,
+      },
+    ]);
+
+    const exported = await portability.exportBundle("company-1", {
+      include: { company: true, agents: false, projects: true, issues: true },
+    });
+
+    const extension = asTextFile(exported.files[".paperclip.yaml"]);
+    expect(extension).toContain("labelIds:");
+    expect(extension).toContain("label-a");
+    expect(extension).toContain("label-b");
+
+    companySvc.create.mockResolvedValue({ id: "company-imported", name: "Imported" });
+    accessSvc.ensureMembership.mockResolvedValue(undefined);
+    agentSvc.list.mockResolvedValue([]);
+    projectSvc.list.mockResolvedValue([]);
+    projectSvc.create.mockResolvedValue({ id: "project-imported", name: "Launch", urlKey: "launch" });
+    issueSvc.create.mockResolvedValue({ id: "issue-imported", title: "Labelled task" });
+
+    await portability.importBundle({
+      source: { type: "inline", rootPath: exported.rootPath, files: exported.files },
+      include: { company: true, agents: false, projects: true, issues: true },
+      target: { mode: "new_company", newCompanyName: "Imported" },
+      agents: "all",
+      collisionStrategy: "rename",
+    }, "user-1");
+
+    expect(issueSvc.create).toHaveBeenCalledWith(
+      "company-imported",
+      expect.objectContaining({
+        labelIds: ["label-a", "label-b"],
+      }),
+    );
   });
 
   it("strips root AGENTS frontmatter when importing a nested agent entry path", async () => {

@@ -24,11 +24,14 @@ import { costRoutes } from "./routes/costs.js";
 import { activityRoutes } from "./routes/activity.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
 import { sidebarBadgeRoutes } from "./routes/sidebar-badges.js";
+import { sidebarPreferenceRoutes } from "./routes/sidebar-preferences.js";
+import { inboxDismissalRoutes } from "./routes/inbox-dismissals.js";
 import { instanceSettingsRoutes } from "./routes/instance-settings.js";
 import { llmRoutes } from "./routes/llms.js";
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
+import { adapterRoutes } from "./routes/adapters.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
@@ -47,8 +50,27 @@ import { createPluginHostServiceCleanup } from "./services/plugin-host-service-c
 import { pluginRegistryService } from "./services/plugin-registry.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
+import { createCachedViteHtmlRenderer } from "./vite-html-renderer.js";
 
 type UiMode = "none" | "static" | "vite-dev";
+const FEEDBACK_EXPORT_FLUSH_INTERVAL_MS = 5_000;
+const VITE_DEV_ASSET_PREFIXES = [
+  "/@fs/",
+  "/@id/",
+  "/@react-refresh",
+  "/@vite/",
+  "/assets/",
+  "/node_modules/",
+  "/src/",
+];
+const VITE_DEV_STATIC_PATHS = new Set([
+  "/apple-touch-icon.png",
+  "/favicon-16x16.png",
+  "/favicon-32x32.png",
+  "/favicon.ico",
+  "/favicon.svg",
+  "/site.webmanifest",
+]);
 
 export function resolveViteHmrPort(serverPort: number): number {
   if (serverPort <= 55_535) {
@@ -57,12 +79,27 @@ export function resolveViteHmrPort(serverPort: number): number {
   return Math.max(1_024, serverPort - 10_000);
 }
 
+function shouldServeViteDevHtml(req: ExpressRequest): boolean {
+  const pathname = req.path;
+  if (VITE_DEV_STATIC_PATHS.has(pathname)) return false;
+  if (VITE_DEV_ASSET_PREFIXES.some((prefix) => pathname.startsWith(prefix))) return false;
+  return req.accepts(["html"]) === "html";
+}
+
 export async function createApp(
   db: Db,
   opts: {
     uiMode: UiMode;
     serverPort: number;
     storageService: StorageService;
+    feedbackExportService?: {
+      flushPendingFeedbackTraces(input?: {
+        companyId?: string;
+        traceId?: string;
+        limit?: number;
+        now?: Date;
+      }): Promise<unknown>;
+    };
     deploymentMode: DeploymentMode;
     deploymentExposure: DeploymentExposure;
     allowedHostnames: string[];
@@ -123,7 +160,7 @@ export async function createApp(
     });
   });
   if (opts.betterAuthHandler) {
-    app.all("/api/auth/*authPath", opts.betterAuthHandler);
+    app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
   }
   app.use(llmRoutes(db));
 
@@ -144,7 +181,9 @@ export async function createApp(
   api.use(agentRoutes(db));
   api.use(assetRoutes(db, opts.storageService));
   api.use(projectRoutes(db));
-  api.use(issueRoutes(db, opts.storageService));
+  api.use(issueRoutes(db, opts.storageService, {
+    feedbackExportService: opts.feedbackExportService,
+  }));
   api.use(routineRoutes(db));
   api.use(executionWorkspaceRoutes(db));
   api.use(goalRoutes(db));
@@ -154,6 +193,8 @@ export async function createApp(
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
   api.use(sidebarBadgeRoutes(db));
+  api.use(sidebarPreferenceRoutes(db));
+  api.use(inboxDismissalRoutes(db));
   api.use(instanceSettingsRoutes(db));
   const hostServicesDisposers = new Map<string, () => void>();
   const workerManager = createPluginWorkerManager();
@@ -179,6 +220,7 @@ export async function createApp(
     jobStore,
   });
   const hostServiceCleanup = createPluginHostServiceCleanup(lifecycle, hostServicesDisposers);
+  let viteHtmlRenderer: ReturnType<typeof createCachedViteHtmlRenderer> | null = null;
   const loader = pluginLoader(
     db,
     { localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR },
@@ -218,6 +260,7 @@ export async function createApp(
       { workerManager },
     ),
   );
+  api.use(adapterRoutes());
   api.use(
     accessRoutes(db, {
       deploymentMode: opts.deploymentMode,
@@ -270,24 +313,45 @@ export async function createApp(
         allowedHosts: privateHostnameGateEnabled ? Array.from(privateHostnameAllowSet) : undefined,
       },
     });
+    viteHtmlRenderer = createCachedViteHtmlRenderer({
+      vite,
+      uiRoot,
+      brandHtml: applyUiBranding,
+    });
+    const renderViteHtml = viteHtmlRenderer;
 
-    app.use(vite.middlewares);
     app.get(/.*/, async (req, res, next) => {
+      if (!shouldServeViteDevHtml(req)) {
+        next();
+        return;
+      }
       try {
-        const templatePath = path.resolve(uiRoot, "index.html");
-        const template = fs.readFileSync(templatePath, "utf-8");
-        const html = applyUiBranding(await vite.transformIndexHtml(req.originalUrl, template));
+        const html = await renderViteHtml.render(req.originalUrl);
         res.status(200).set({ "Content-Type": "text/html" }).end(html);
       } catch (err) {
         next(err);
       }
     });
+    app.use(vite.middlewares);
   }
 
   app.use(errorHandler);
 
   jobCoordinator.start();
   scheduler.start();
+  const feedbackExportTimer = opts.feedbackExportService
+    ? setInterval(() => {
+      void opts.feedbackExportService?.flushPendingFeedbackTraces().catch((err) => {
+        logger.error({ err }, "Failed to flush pending feedback exports");
+      });
+    }, FEEDBACK_EXPORT_FLUSH_INTERVAL_MS)
+    : null;
+  feedbackExportTimer?.unref?.();
+  if (opts.feedbackExportService) {
+    void opts.feedbackExportService.flushPendingFeedbackTraces().catch((err) => {
+      logger.error({ err }, "Failed to flush pending feedback exports");
+    });
+  }
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });
@@ -308,7 +372,9 @@ export async function createApp(
     logger.error({ err }, "Failed to load ready plugins on startup");
   });
   process.once("exit", () => {
+    if (feedbackExportTimer) clearInterval(feedbackExportTimer);
     devWatcher?.close();
+    viteHtmlRenderer?.dispose();
     hostServiceCleanup.disposeAll();
     hostServiceCleanup.teardown();
   });

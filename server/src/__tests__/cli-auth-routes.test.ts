@@ -34,33 +34,48 @@ vi.mock("../services/index.js", () => ({
   deduplicateAgentName: vi.fn((name: string) => name),
 }));
 
-function createApp(actor: any) {
+function registerModuleMocks() {
+  vi.doMock("../services/index.js", () => ({
+    accessService: () => mockAccessService,
+    agentService: () => mockAgentService,
+    boardAuthService: () => mockBoardAuthService,
+    logActivity: mockLogActivity,
+    notifyHireApproved: vi.fn(),
+    deduplicateAgentName: vi.fn((name: string) => name),
+  }));
+}
+
+async function createApp(actor: any) {
+  const [{ accessRoutes }, { errorHandler }] = await Promise.all([
+    vi.importActual<typeof import("../routes/access.js")>("../routes/access.js"),
+    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+  ]);
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
     req.actor = actor;
     next();
   });
-  return import("../routes/access.js").then(({ accessRoutes }) =>
-    import("../middleware/index.js").then(({ errorHandler }) => {
-      app.use(
-        "/api",
-        accessRoutes({} as any, {
-          deploymentMode: "authenticated",
-          deploymentExposure: "private",
-          bindHost: "127.0.0.1",
-          allowedHostnames: [],
-        }),
-      );
-      app.use(errorHandler);
-      return app;
-    })
+  app.use(
+    "/api",
+    accessRoutes({} as any, {
+      deploymentMode: "authenticated",
+      deploymentExposure: "private",
+      bindHost: "127.0.0.1",
+      allowedHostnames: [],
+    }),
   );
+  app.use(errorHandler);
+  return app;
 }
 
 describe("cli auth routes", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetModules();
+    vi.doUnmock("../routes/access.js");
+    vi.doUnmock("../middleware/index.js");
+    registerModuleMocks();
+    vi.resetAllMocks();
   });
 
   it("creates a CLI auth challenge with approval metadata", async () => {
@@ -147,13 +162,11 @@ describe("cli auth routes", () => {
       .send({ token: "pcp_cli_auth_secret" });
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({
-      approved: true,
-      status: "approved",
-      userId: "user-1",
-      keyId: "board-key-1",
-      expiresAt: "2026-03-23T13:00:00.000Z",
-    });
+    expect(mockBoardAuthService.approveCliAuthChallenge).toHaveBeenCalledWith(
+      "challenge-1",
+      "pcp_cli_auth_secret",
+      "user-1",
+    );
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
