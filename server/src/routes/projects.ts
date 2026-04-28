@@ -10,9 +10,10 @@ import {
   updateProjectWorkspaceSchema,
   workspaceRuntimeControlTargetSchema,
 } from "@paperclipai/shared";
+import type { WorkspaceRuntimeDesiredState, WorkspaceRuntimeServiceStateMap } from "@paperclipai/shared";
 import { trackProjectCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
-import { projectService, logActivity, secretService, workspaceOperationService } from "../services/index.js";
+import { projectService, logActivity, workspaceOperationService } from "../services/index.js";
 import { conflict } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import {
@@ -22,7 +23,19 @@ import {
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForProjectWorkspace,
 } from "../services/workspace-runtime.js";
+import {
+  assertNoAgentHostWorkspaceCommandMutation,
+  collectProjectExecutionWorkspaceCommandPaths,
+  collectProjectWorkspaceCommandPaths,
+} from "./workspace-command-authz.js";
+import { assertCanManageProjectWorkspaceRuntimeServices } from "./workspace-runtime-service-authz.js";
 import { getTelemetryClient } from "../telemetry.js";
+import { appendWithCap } from "../adapters/utils.js";
+import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
+import { environmentService } from "../services/environments.js";
+import { secretService } from "../services/secrets.js";
+
+const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
 
 export function projectRoutes(db: Db) {
   const router = Router();
@@ -30,6 +43,22 @@ export function projectRoutes(db: Db) {
   const secretsSvc = secretService(db);
   const workspaceOperations = workspaceOperationService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
+  const environmentsSvc = environmentService(db);
+
+  async function assertProjectEnvironmentSelection(companyId: string, environmentId: string | null | undefined) {
+    if (environmentId === undefined || environmentId === null) return;
+    await assertEnvironmentSelectionForCompany(environmentsSvc, companyId, environmentId, {
+      allowedDrivers: ["local", "ssh", "sandbox"],
+    });
+  }
+
+  function readProjectPolicyEnvironmentId(policy: unknown): string | null | undefined {
+    if (!policy || typeof policy !== "object" || !("environmentId" in policy)) {
+      return undefined;
+    }
+    const environmentId = (policy as { environmentId?: unknown }).environmentId;
+    return typeof environmentId === "string" || environmentId === null ? environmentId : undefined;
+  }
 
   async function resolveCompanyIdForProjectReference(req: Request) {
     const companyIdQuery = req.query.companyId;
@@ -93,6 +122,17 @@ export function projectRoutes(db: Db) {
     };
 
     const { workspace, ...projectData } = req.body as CreateProjectPayload;
+    await assertProjectEnvironmentSelection(
+      companyId,
+      readProjectPolicyEnvironmentId(projectData.executionWorkspacePolicy),
+    );
+    assertNoAgentHostWorkspaceCommandMutation(
+      req,
+      [
+        ...collectProjectExecutionWorkspaceCommandPaths(projectData.executionWorkspacePolicy),
+        ...collectProjectWorkspaceCommandPaths(workspace, "workspace"),
+      ],
+    );
     if (projectData.env !== undefined) {
       projectData.env = await secretsSvc.normalizeEnvBindingsForPersistence(
         companyId,
@@ -144,6 +184,14 @@ export function projectRoutes(db: Db) {
     }
     assertCompanyAccess(req, existing.companyId);
     const body = { ...req.body };
+    assertNoAgentHostWorkspaceCommandMutation(
+      req,
+      collectProjectExecutionWorkspaceCommandPaths(body.executionWorkspacePolicy),
+    );
+    await assertProjectEnvironmentSelection(
+      existing.companyId,
+      readProjectPolicyEnvironmentId(body.executionWorkspacePolicy),
+    );
     if (typeof body.archivedAt === "string") {
       body.archivedAt = new Date(body.archivedAt);
     }
@@ -200,6 +248,10 @@ export function projectRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, existing.companyId);
+    assertNoAgentHostWorkspaceCommandMutation(
+      req,
+      collectProjectWorkspaceCommandPaths(req.body),
+    );
     const workspace = await svc.createWorkspace(id, req.body);
     if (!workspace) {
       res.status(422).json({ error: "Invalid project workspace payload" });
@@ -238,6 +290,10 @@ export function projectRoutes(db: Db) {
         return;
       }
       assertCompanyAccess(req, existing.companyId);
+      assertNoAgentHostWorkspaceCommandMutation(
+        req,
+        collectProjectWorkspaceCommandPaths(req.body),
+      );
       const workspaceExists = (await svc.listWorkspaces(id)).some((workspace) => workspace.id === workspaceId);
       if (!workspaceExists) {
         res.status(404).json({ error: "Project workspace not found" });
@@ -289,6 +345,11 @@ export function projectRoutes(db: Db) {
       res.status(404).json({ error: "Project workspace not found" });
       return;
     }
+
+    await assertCanManageProjectWorkspaceRuntimeServices(db, req, {
+      companyId: project.companyId,
+      projectWorkspaceId: workspace.id,
+    });
 
     const workspaceCwd = workspace.cwd;
     if (!workspaceCwd) {
@@ -347,8 +408,8 @@ export function projectRoutes(db: Db) {
     const actor = getActorInfo(req);
     const recorder = workspaceOperations.createRecorder({ companyId: project.companyId });
     let runtimeServiceCount = workspace.runtimeServices?.length ?? 0;
-    const stdout: string[] = [];
-    const stderr: string[] = [];
+    let stdout = "";
+    let stderr = "";
 
     const operation = await recorder.recordOperation({
       phase: action === "stop" ? "workspace_teardown" : "workspace_provision",
@@ -410,8 +471,8 @@ export function projectRoutes(db: Db) {
         }
 
         const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-          if (stream === "stdout") stdout.push(chunk);
-          else stderr.push(chunk);
+          if (stream === "stdout") stdout = appendWithCap(stdout, chunk, WORKSPACE_CONTROL_OUTPUT_MAX_CHARS);
+          else stderr = appendWithCap(stderr, chunk, WORKSPACE_CONTROL_OUTPUT_MAX_CHARS);
         };
 
         if (action === "stop" || action === "restart") {
@@ -455,14 +516,14 @@ export function projectRoutes(db: Db) {
           runtimeServiceCount = selectedRuntimeServiceId ? Math.max(0, (workspace.runtimeServices?.length ?? 1) - 1) : 0;
         }
 
-        const currentDesiredState: "running" | "stopped" =
+        const currentDesiredState: WorkspaceRuntimeDesiredState =
           workspace.runtimeConfig?.desiredState
           ?? ((workspace.runtimeServices ?? []).some((service) => service.status === "starting" || service.status === "running")
             ? "running"
             : "stopped");
         const nextRuntimeState: {
-          desiredState: "running" | "stopped";
-          serviceStates: Record<string, "running" | "stopped"> | null | undefined;
+          desiredState: WorkspaceRuntimeDesiredState;
+          serviceStates: WorkspaceRuntimeServiceStateMap | null | undefined;
         } = selectedRuntimeServiceId && (selectedServiceIndex === undefined || selectedServiceIndex === null)
           ? {
               desiredState: currentDesiredState,
@@ -484,8 +545,8 @@ export function projectRoutes(db: Db) {
 
         return {
           status: "succeeded",
-          stdout: stdout.join(""),
-          stderr: stderr.join(""),
+          stdout,
+          stderr,
           system:
             action === "stop"
               ? "Stopped project workspace runtime services.\n"

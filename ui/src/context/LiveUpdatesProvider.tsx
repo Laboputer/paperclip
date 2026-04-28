@@ -3,12 +3,14 @@ import { useQuery, useQueryClient, type InfiniteData, type QueryClient } from "@
 import type { Agent, Issue, IssueComment, LiveEvent } from "@paperclipai/shared";
 import type { RunForIssue } from "../api/activity";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
+import type { CompanyUserDirectoryResponse } from "../api/access";
 import { issuesApi } from "../api/issues";
 import { authApi } from "../api/auth";
 import { useCompany } from "./CompanyContext";
 import type { ToastInput } from "./ToastContext";
 import { useToastActions } from "./ToastContext";
 import { upsertIssueCommentInPages } from "../lib/optimistic-issue-comments";
+import { clearIssueExecutionRun, removeLiveRunById } from "../lib/optimistic-issue-runs";
 import { queryKeys } from "../lib/queryKeys";
 import { toCompanyRelativePath } from "../lib/company-routes";
 import { useLocation } from "../lib/router";
@@ -18,6 +20,7 @@ const TOAST_COOLDOWN_MAX = 3;
 const RECONNECT_SUPPRESS_MS = 2000;
 const SOCKET_CONNECTING = 0;
 const SOCKET_OPEN = 1;
+const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
 
 type LiveUpdatesSocketLike = {
   readyState: number;
@@ -52,6 +55,19 @@ function resolveAgentName(
   return agent?.name ?? null;
 }
 
+function resolveUserName(
+  queryClient: QueryClient,
+  companyId: string,
+  userId: string,
+): string | null {
+  const directory = queryClient.getQueryData<CompanyUserDirectoryResponse>(
+    queryKeys.access.companyUserDirectory(companyId),
+  );
+  if (!directory) return null;
+  const entry = directory.users.find((u) => u.principalId === userId);
+  return entry?.user?.name?.trim() || entry?.user?.email?.trim() || null;
+}
+
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
   return text.slice(0, max - 1) + "\u2026";
@@ -68,7 +84,7 @@ function resolveActorLabel(
   }
   if (actorType === "system") return "System";
   if (actorType === "user" && actorId) {
-    return "Board";
+    return resolveUserName(queryClient, companyId, actorId) ?? "Board";
   }
   return "Someone";
 }
@@ -243,6 +259,46 @@ function shouldSuppressRunStatusToastForVisibleIssue(
 
   const agentId = readString(payload.agentId);
   return !!agentId && !!context.assigneeAgentId && agentId === context.assigneeAgentId;
+}
+
+function invalidateVisibleIssueRunQueries(
+  queryClient: QueryClient,
+  pathname: string,
+  payload: Record<string, unknown>,
+  options?: VisibleRouteOptions,
+): boolean {
+  const context = resolveVisibleIssueRouteContext(queryClient, pathname, options);
+  if (!context) return false;
+
+  const runId = readString(payload.runId);
+  const agentId = readString(payload.agentId);
+  const matchesVisibleIssue =
+    (runId !== null && context.runIds.has(runId)) ||
+    (!!agentId && !!context.assigneeAgentId && agentId === context.assigneeAgentId);
+  if (!matchesVisibleIssue) return false;
+
+  const status = readString(payload.status);
+  if (runId && status && TERMINAL_RUN_STATUSES.has(status)) {
+    queryClient.setQueryData(
+      queryKeys.issues.liveRuns(context.routeIssueRef),
+      (current: LiveRunForIssue[] | undefined) => removeLiveRunById(current, runId),
+    );
+    queryClient.setQueryData(
+      queryKeys.issues.activeRun(context.routeIssueRef),
+      (current: ActiveRunForIssue | null | undefined) => (current?.id === runId ? null : current),
+    );
+    queryClient.setQueryData(
+      queryKeys.issues.detail(context.routeIssueRef),
+      (current: Issue | undefined) => clearIssueExecutionRun(current, runId),
+    );
+  }
+
+  queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(context.routeIssueRef) });
+  queryClient.invalidateQueries({ queryKey: queryKeys.issues.activity(context.routeIssueRef) });
+  queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(context.routeIssueRef) });
+  queryClient.invalidateQueries({ queryKey: queryKeys.issues.liveRuns(context.routeIssueRef) });
+  queryClient.invalidateQueries({ queryKey: queryKeys.issues.activeRun(context.routeIssueRef) });
+  return true;
 }
 
 function shouldSuppressAgentStatusToastForVisibleIssue(
@@ -625,6 +681,9 @@ function invalidateActivityQueries(
         if (action === "issue.comment_added") {
           queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(ref), ...invalidationOptions });
         }
+        if (action?.startsWith("issue.thread_interaction_")) {
+          queryClient.invalidateQueries({ queryKey: queryKeys.issues.interactions(ref), ...invalidationOptions });
+        }
       }
     }
     return;
@@ -735,6 +794,7 @@ function handleLiveEvent(
 
   if (event.type === "heartbeat.run.queued" || event.type === "heartbeat.run.status") {
     invalidateHeartbeatQueries(queryClient, expectedCompanyId, payload);
+    invalidateVisibleIssueRunQueries(queryClient, pathname, payload);
     if (event.type === "heartbeat.run.status") {
       const toast = buildRunStatusToast(payload, nameOf);
       if (
@@ -830,6 +890,7 @@ export const __liveUpdatesTestUtils = {
   closeSocketQuietly,
   hydrateVisibleIssueComment,
   invalidateActivityQueries,
+  invalidateVisibleIssueRunQueries,
   resolveLiveCompanyId,
   shouldDeferIssueRefetchForVisibleAgentActivity,
   shouldDeferVisibleIssueCommentActivity,

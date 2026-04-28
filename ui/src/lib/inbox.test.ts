@@ -12,6 +12,7 @@ import type {
 } from "@paperclipai/shared";
 import {
   DEFAULT_INBOX_ISSUE_COLUMNS,
+  buildGroupedInboxSections,
   buildInboxKeyboardNavEntries,
   buildInboxDismissedAtByKey,
   computeInboxBadgeData,
@@ -45,6 +46,7 @@ import {
   saveInboxIssueColumns,
   saveInboxWorkItemGroupBy,
   saveLastInboxTab,
+  shouldShowCompanyAlerts,
   shouldResetInboxWorkspaceGrouping,
   shouldShowInboxSection,
   type InboxWorkItem,
@@ -145,6 +147,10 @@ function makeRun(id: string, status: HeartbeatRun["status"], createdAt: string, 
     logBytes: null,
     logSha256: null,
     logCompressed: false,
+    lastOutputAt: null,
+    lastOutputSeq: 0,
+    lastOutputStream: null,
+    lastOutputBytes: null,
     errorCode: null,
     externalRunId: null,
     processPid: null,
@@ -152,6 +158,11 @@ function makeRun(id: string, status: HeartbeatRun["status"], createdAt: string, 
     processStartedAt: null,
     retryOfRunId: null,
     processLossRetryCount: 0,
+    livenessState: null,
+    livenessReason: null,
+    continuationAttempt: 0,
+    lastUsefulActionAt: null,
+    nextAction: null,
     stdoutExcerpt: null,
     stderrExcerpt: null,
     contextSnapshot: null,
@@ -288,6 +299,7 @@ const dashboard: DashboardSummary = {
     pausedAgents: 0,
     pausedProjects: 0,
   },
+  runActivity: [],
 };
 
 describe("inbox helpers", () => {
@@ -297,7 +309,10 @@ describe("inbox helpers", () => {
 
   it("counts the same inbox sources the badge uses", () => {
     const result = computeInboxBadgeData({
-      approvals: [makeApproval("pending"), makeApproval("approved")],
+      approvals: [
+        { ...makeApproval("pending"), requestedByUserId: "user-1" },
+        { ...makeApproval("approved"), requestedByUserId: "user-2" },
+      ],
       joinRequests: [makeJoinRequest("join-1")],
       dashboard,
       heartbeatRuns: [
@@ -308,10 +323,11 @@ describe("inbox helpers", () => {
       mineIssues: [makeIssue("1", true)],
       dismissedAlerts: new Set<string>(),
       dismissedAtByKey: new Map<string, number>(),
+      currentUserId: "user-1",
     });
 
     expect(result).toEqual({
-      inbox: 6,
+      inbox: 5,
       approvals: 1,
       failedRuns: 2,
       joinRequests: 1,
@@ -329,6 +345,7 @@ describe("inbox helpers", () => {
       mineIssues: [],
       dismissedAlerts: new Set<string>(["alert:budget", "alert:agent-errors"]),
       dismissedAtByKey: new Map<string, number>([["run:run-1", new Date("2026-03-11T00:00:00.000Z").getTime()]]),
+      currentUserId: "user-1",
     });
 
     expect(result).toEqual({
@@ -350,10 +367,12 @@ describe("inbox helpers", () => {
       mineIssues: [makeIssue("1", false), makeIssue("2", false), makeIssue("3", true)],
       dismissedAlerts: new Set<string>(),
       dismissedAtByKey: new Map(),
+      currentUserId: "user-1",
     });
 
     expect(result.mineIssues).toBe(1);
-    expect(result.inbox).toBe(3);
+    expect(result.inbox).toBe(1);
+    expect(result.alerts).toBe(2);
   });
 
   it("resurfaces non-issue items when they change after dismissal", () => {
@@ -392,18 +411,23 @@ describe("inbox helpers", () => {
     expect(issues).toHaveLength(2);
   });
 
-  it("shows recent approvals in updated order and unread approvals as actionable only", () => {
+  it("shows actionable approvals on mine, while recent and unread stay company-wide", () => {
     const approvals = [
-      makeApprovalWithTimestamps("approval-approved", "approved", "2026-03-11T02:00:00.000Z"),
-      makeApprovalWithTimestamps("approval-pending", "pending", "2026-03-11T01:00:00.000Z"),
-      makeApprovalWithTimestamps(
-        "approval-revision",
-        "revision_requested",
-        "2026-03-11T03:00:00.000Z",
-      ),
+      {
+        ...makeApprovalWithTimestamps("approval-approved", "approved", "2026-03-11T02:00:00.000Z"),
+        requestedByUserId: "user-1",
+      },
+      {
+        ...makeApprovalWithTimestamps("approval-pending", "pending", "2026-03-11T01:00:00.000Z"),
+        requestedByUserId: "user-2",
+      },
+      {
+        ...makeApprovalWithTimestamps("approval-revision", "revision_requested", "2026-03-11T03:00:00.000Z"),
+        decidedByUserId: "user-1",
+      },
     ];
 
-    expect(getApprovalsForTab(approvals, "mine", "all").map((approval) => approval.id)).toEqual([
+    expect(getApprovalsForTab(approvals, "mine", "all", "user-1").map((approval) => approval.id)).toEqual([
       "approval-revision",
       "approval-approved",
       "approval-pending",
@@ -420,6 +444,52 @@ describe("inbox helpers", () => {
     expect(getApprovalsForTab(approvals, "all", "resolved").map((approval) => approval.id)).toEqual([
       "approval-approved",
     ]);
+  });
+
+  it("surfaces agent-requested actionable approvals in mine and the badge", () => {
+    const approvals = [
+      {
+        ...makeApprovalWithTimestamps("approval-agent-requested", "pending", "2026-03-11T02:00:00.000Z"),
+        requestedByUserId: null,
+      },
+      {
+        ...makeApprovalWithTimestamps("approval-unrelated-resolved", "approved", "2026-03-11T03:00:00.000Z"),
+        requestedByUserId: "user-2",
+      },
+    ];
+
+    expect(getApprovalsForTab(approvals, "mine", "all", "user-1").map((approval) => approval.id)).toEqual([
+      "approval-agent-requested",
+    ]);
+
+    const result = computeInboxBadgeData({
+      approvals,
+      joinRequests: [],
+      dashboard,
+      heartbeatRuns: [],
+      mineIssues: [],
+      dismissedAlerts: new Set<string>(),
+      dismissedAtByKey: new Map(),
+      currentUserId: "user-1",
+    });
+
+    expect(result.approvals).toBe(1);
+  });
+
+  it("does not count company-wide alerts in the personal inbox badge", () => {
+    const result = computeInboxBadgeData({
+      approvals: [],
+      joinRequests: [],
+      dashboard,
+      heartbeatRuns: [],
+      mineIssues: [],
+      dismissedAlerts: new Set<string>(),
+      dismissedAtByKey: new Map(),
+      currentUserId: "user-1",
+    });
+
+    expect(result.alerts).toBe(2);
+    expect(result.inbox).toBe(0);
   });
 
   it("mixes approvals into the inbox feed by most recent activity", () => {
@@ -545,7 +615,9 @@ describe("inbox helpers", () => {
     expect(
       buildInboxKeyboardNavEntries(groupedSections, new Set(), new Set()).map((entry) => entry.type === "top"
         ? entry.itemKey
-        : entry.issueId),
+        : entry.type === "child"
+          ? entry.issueId
+          : entry.groupKey),
     ).toEqual([
       `workspace:default:${getInboxWorkItemKey({ kind: "issue", timestamp: 2, issue: parentIssue })}`,
       childIssue.id,
@@ -554,10 +626,53 @@ describe("inbox helpers", () => {
     expect(
       buildInboxKeyboardNavEntries(groupedSections, new Set(), new Set([parentIssue.id])).map((entry) => entry.type === "top"
         ? entry.itemKey
-        : entry.issueId),
+        : entry.type === "child"
+          ? entry.issueId
+          : entry.groupKey),
     ).toEqual([
       `workspace:default:${getInboxWorkItemKey({ kind: "issue", timestamp: 2, issue: parentIssue })}`,
     ]);
+  });
+
+  it("emits a group nav entry for labeled groups and omits children when the group is collapsed", () => {
+    const visibleIssue = makeIssue("visible", true);
+    const hiddenIssue = makeIssue("hidden", true);
+    const groupedSections = [
+      {
+        key: "priority:high",
+        label: "High priority",
+        displayItems: [{ kind: "issue", timestamp: 3, issue: visibleIssue } satisfies InboxWorkItem],
+        childrenByIssueId: new Map(),
+      },
+      {
+        key: "priority:medium",
+        label: "Medium priority",
+        displayItems: [{ kind: "issue", timestamp: 2, issue: hiddenIssue } satisfies InboxWorkItem],
+        childrenByIssueId: new Map(),
+      },
+    ];
+
+    const expanded = buildInboxKeyboardNavEntries(groupedSections, new Set(), new Set());
+    expect(expanded.map((entry) => entry.type)).toEqual(["group", "top", "group", "top"]);
+    expect(expanded[0]).toEqual({
+      type: "group",
+      groupKey: "priority:high",
+      label: "High priority",
+      collapsed: false,
+    });
+
+    const collapsed = buildInboxKeyboardNavEntries(
+      groupedSections,
+      new Set(["priority:medium"]),
+      new Set(),
+    );
+    expect(collapsed.map((entry) => entry.type)).toEqual(["group", "top", "group"]);
+    expect(collapsed[2]).toEqual({
+      type: "group",
+      groupKey: "priority:medium",
+      label: "Medium priority",
+      collapsed: true,
+    });
   });
 
   it("sorts self-touched issues without external comments by updatedAt", () => {
@@ -611,6 +726,13 @@ describe("inbox helpers", () => {
         showOnAll: false,
       }),
     ).toBe(false);
+  });
+
+  it("shows company alerts only on the all tab", () => {
+    expect(shouldShowCompanyAlerts("mine")).toBe(false);
+    expect(shouldShowCompanyAlerts("recent")).toBe(false);
+    expect(shouldShowCompanyAlerts("unread")).toBe(false);
+    expect(shouldShowCompanyAlerts("all")).toBe(true);
   });
 
   it("limits recent touched issues before unread badge counting", () => {
@@ -715,10 +837,12 @@ describe("inbox helpers", () => {
           statuses: ["in_progress"],
           priorities: [],
           assignees: [],
+          creators: [],
           labels: [],
           projects: [],
           workspaces: [],
-          showRoutineExecutions: false,
+          liveOnly: false,
+          hideRoutineExecutions: true,
         },
       }).map((issue) => issue.id),
     ).toEqual(["remote-match"]);
@@ -733,10 +857,12 @@ describe("inbox helpers", () => {
           statuses: [],
           priorities: [],
           assignees: [],
+          creators: [],
           labels: [],
           projects: [],
           workspaces: [],
-          showRoutineExecutions: false,
+          liveOnly: false,
+          hideRoutineExecutions: true,
         },
       }),
     ).toEqual([]);
@@ -751,13 +877,54 @@ describe("inbox helpers", () => {
           statuses: [],
           priorities: [],
           assignees: [],
+          creators: [],
           labels: [],
           projects: [],
           workspaces: [],
-          showRoutineExecutions: false,
+          liveOnly: false,
+          hideRoutineExecutions: true,
         },
       }),
     ).toEqual([]);
+  });
+
+  it("keeps inbox search matches ahead of archived and other result sections", () => {
+    const inboxIssue = makeIssue("inbox", false);
+    inboxIssue.lastActivityAt = new Date("2026-03-11T04:00:00.000Z");
+
+    const archivedIssue = makeIssue("archived", false);
+    archivedIssue.lastActivityAt = new Date("2026-03-11T03:00:00.000Z");
+
+    const otherIssue = makeIssue("other", false);
+    otherIssue.lastActivityAt = new Date("2026-03-11T05:00:00.000Z");
+
+    const sections = [
+      ...buildGroupedInboxSections(
+        getInboxWorkItems({ issues: [inboxIssue], approvals: [] }),
+        "none",
+        {},
+      ),
+      ...buildGroupedInboxSections(
+        getInboxWorkItems({ issues: [archivedIssue], approvals: [] }),
+        "none",
+        {},
+        { keyPrefix: "archived-search:", searchSection: "archived" },
+      ),
+      ...buildGroupedInboxSections(
+        getInboxWorkItems({ issues: [otherIssue], approvals: [] }),
+        "none",
+        {},
+        { keyPrefix: "other-search:", searchSection: "other" },
+      ),
+    ];
+
+    expect(sections.map((section) => section.searchSection)).toEqual(["none", "archived", "other"]);
+    expect(
+      sections.map((section) => {
+        const [item] = section.displayItems;
+        return item?.kind === "issue" ? item.issue.id : null;
+      }),
+    ).toEqual(["inbox", "archived", "other"]);
   });
 
   it("defaults the remembered inbox tab to mine and persists all", () => {
@@ -776,10 +943,12 @@ describe("inbox helpers", () => {
         statuses: ["todo"],
         priorities: ["high"],
         assignees: ["agent-1"],
+        creators: ["user:user-1"],
         labels: ["label-1"],
         projects: ["project-1"],
         workspaces: ["workspace-1"],
-        showRoutineExecutions: true,
+        liveOnly: true,
+        hideRoutineExecutions: false,
       },
     });
     saveInboxFilterPreferences("company-2", {
@@ -789,10 +958,12 @@ describe("inbox helpers", () => {
         statuses: ["done"],
         priorities: [],
         assignees: [],
+        creators: [],
         labels: [],
         projects: [],
         workspaces: [],
-        showRoutineExecutions: false,
+        liveOnly: false,
+        hideRoutineExecutions: true,
       },
     });
 
@@ -803,10 +974,12 @@ describe("inbox helpers", () => {
         statuses: ["todo"],
         priorities: ["high"],
         assignees: ["agent-1"],
+        creators: ["user:user-1"],
         labels: ["label-1"],
         projects: ["project-1"],
         workspaces: ["workspace-1"],
-        showRoutineExecutions: true,
+        liveOnly: true,
+        hideRoutineExecutions: false,
       },
     });
     expect(loadInboxFilterPreferences("company-2")).toEqual({
@@ -816,10 +989,12 @@ describe("inbox helpers", () => {
         statuses: ["done"],
         priorities: [],
         assignees: [],
+        creators: [],
         labels: [],
         projects: [],
         workspaces: [],
-        showRoutineExecutions: false,
+        liveOnly: false,
+        hideRoutineExecutions: true,
       },
     });
   });
@@ -832,10 +1007,12 @@ describe("inbox helpers", () => {
         statuses: ["todo", 123],
         priorities: "high",
         assignees: ["agent-1"],
+        creators: ["user:user-1", 42],
         labels: null,
         projects: ["project-1"],
         workspaces: ["workspace-1", false],
-        showRoutineExecutions: "yes",
+        liveOnly: "yes",
+        hideRoutineExecutions: "yes",
       },
     }));
 
@@ -846,10 +1023,12 @@ describe("inbox helpers", () => {
         statuses: ["todo"],
         priorities: [],
         assignees: ["agent-1"],
+        creators: ["user:user-1"],
         labels: [],
         projects: ["project-1"],
         workspaces: ["workspace-1"],
-        showRoutineExecutions: false,
+        liveOnly: false,
+        hideRoutineExecutions: false,
       },
     });
   });
@@ -1003,12 +1182,12 @@ describe("inbox helpers", () => {
     expect(getInboxKeyboardSelectionIndex(0, 3, "previous")).toBe(0);
   });
 
-  it("hides routine execution issues until the toggle is enabled", () => {
+  it("hides routine execution issues when the hide toggle is enabled", () => {
     const manualIssue = { ...makeIssue("manual", true), originKind: "manual" as const };
     const routineIssue = { ...makeIssue("routine", true), originKind: "routine_execution" as const };
 
-    expect(filterInboxIssues([manualIssue, routineIssue], false)).toEqual([manualIssue]);
-    expect(filterInboxIssues([manualIssue, routineIssue], true)).toEqual([manualIssue, routineIssue]);
+    expect(filterInboxIssues([manualIssue, routineIssue], false)).toEqual([manualIssue, routineIssue]);
+    expect(filterInboxIssues([manualIssue, routineIssue], true)).toEqual([manualIssue]);
   });
 
   it("groups mixed inbox items by type while preserving item order within each group", () => {
